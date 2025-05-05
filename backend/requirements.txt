@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+motor
+pydantic
+python-dotenv
+httpx
+motor 
+groq
+email-validator
+python-jose
+passlib
+python-multipart
+bcrypt
