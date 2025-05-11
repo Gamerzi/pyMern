@@ -1,41 +1,65 @@
 # backend/app/db.py
 
 import os
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket, AsyncIOMotorDatabase # Import Database type hint
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket, AsyncIOMotorDatabase
 from dotenv import load_dotenv
-from typing import Optional # Import Optional
-from pathlib import Path # <--- ADD THIS LINE TO IMPORT Path
-from bson import ObjectId # Needed for GridFS ID conversion
+from typing import Optional
+from pathlib import Path
+from bson import ObjectId
+import certifi  # <--- IMPORT certifi
 
 # Load env vars
-# Corrected path assuming db.py is in backend/app/ and config/.env is in project_root/config/
-env_path = Path(__file__).parent.parent.parent / "config" / ".env" # More robust path construction
+env_path = Path(__file__).parent.parent.parent / "config" / ".env"
 load_dotenv(dotenv_path=env_path)
 
 # --- Global Variables ---
-# Add type hints for clarity
 client: Optional[AsyncIOMotorClient] = None
-mongodb: Optional[AsyncIOMotorDatabase] = None # Use the specific type hint
+mongodb: Optional[AsyncIOMotorDatabase] = None
 fs_bucket: Optional[AsyncIOMotorGridFSBucket] = None
 
 async def connect_db():
     """
     Initialize MongoDB connection, database handle, and GridFS bucket.
+    Uses certifi for reliable TLS certificate validation.
     """
     global client, mongodb, fs_bucket
     mongo_uri = os.getenv('MONGODB_URI')
-    mongo_db_name = os.getenv('MONGODB_DB', 'futureself') # Default value if not set
+    mongo_db_name = os.getenv('MONGODB_DB', 'futureself')
 
-    # Add check for missing URI
     if not mongo_uri:
         raise ValueError("MONGODB_URI environment variable not set or found in .env file")
 
-    print(f"DEBUG: Connecting to MongoDB at {mongo_uri.split('@')[-1] if '@' in mongo_uri else mongo_uri}...") # Avoid logging credentials
-    client = AsyncIOMotorClient(mongo_uri)
-    mongodb = client[mongo_db_name] # Assign to global mongodb variable
-    fs_bucket = AsyncIOMotorGridFSBucket(mongodb)
-    print(f"DEBUG: Connected to database '{mongo_db_name}'.")
+    # ---> START CHANGE <---
+    # Get the path to the CA bundle from certifi
+    ca = certifi.where()
+    print(f"DEBUG: Using CA certificate bundle from: {ca}")
+    # ---> END CHANGE <---
 
+    # Avoid logging credentials in production logs
+    log_uri = mongo_uri.split('@')[-1] if '@' in mongo_uri else mongo_uri
+    print(f"DEBUG: Connecting to MongoDB at {log_uri}...")
+
+    try:
+        # ---> MODIFIED LINE: Pass tlsCAFile=ca to the client constructor <---
+        client = AsyncIOMotorClient(mongo_uri, tlsCAFile=ca)
+
+        # Optional: Add server selection timeout for faster failure if needed,
+        # but the default (30s) is usually fine. Example:
+        # client = AsyncIOMotorClient(mongo_uri, tlsCAFile=ca, serverSelectionTimeoutMS=15000)
+
+        # The ismaster command is cheap and does explicit server selection.
+        # Good for verifying the connection works immediately.
+        await client.admin.command('ismaster')
+        print("DEBUG: Successfully connected to MongoDB and verified connection.")
+
+        mongodb = client[mongo_db_name]
+        fs_bucket = AsyncIOMotorGridFSBucket(mongodb)
+        print(f"DEBUG: Initialized database handle '{mongo_db_name}' and GridFS bucket.")
+
+    except Exception as e:
+        print(f"ERROR: Failed to connect to MongoDB: {e}")
+        # Re-raise the exception so the application knows connection failed
+        raise
 
 async def close_db():
     """
@@ -45,37 +69,44 @@ async def close_db():
     if client:
         print("DEBUG: Closing MongoDB connection...")
         client.close()
+        client = None # Ensure client is reset
+        mongodb = None # Reset DB handle too
+        fs_bucket = None # Reset GridFS bucket
         print("DEBUG: MongoDB connection closed.")
 
 
-# --- ADD THIS DEPENDENCY FUNCTION ---
+# --- Dependency Function ---
 def get_db() -> AsyncIOMotorDatabase:
     """
     FastAPI Dependency function to get the database handle.
-
-    Returns the global 'mongodb' object initialized by connect_db during app startup.
-
-    Raises:
-        RuntimeError: If the database connection hasn't been established yet.
     """
-    # This check ensures connect_db (called by lifespan) has run
     if mongodb is None:
-        raise RuntimeError("Database connection not initialized. Lifespan manager might have failed.")
+        # This might happen if connect_db failed during startup
+        print("ERROR: get_db called but database connection is not initialized.")
+        raise RuntimeError("Database connection not initialized. Lifespan manager might have failed or connection error occurred.")
     return mongodb
-# --- END OF ADDED FUNCTION ---
 
-
+# --- Collection Helper ---
 def get_collection(name: str):
     """
     Retrieve a collection by name from the database.
-    Requires the database to be connected.
     """
-    db = get_db() # Use the dependency function to ensure connection
+    db = get_db() # Use the dependency function
     return db[name]
+
+# --- GridFS Helper ---
+def get_fs_bucket() -> AsyncIOMotorGridFSBucket:
+    """
+    Gets the GridFS bucket instance. Ensures it's initialized.
+    """
+    global fs_bucket
+    if fs_bucket is None:
+        print("ERROR: get_fs_bucket called but GridFS bucket is not initialized.")
+        raise RuntimeError("GridFS bucket not initialized. Check database connection.")
+    return fs_bucket
 
 
 # --- CRUD utility functions ---
-# These should now use get_collection to ensure DB is ready
 
 async def insert_document(collection_name: str, document: dict) -> str:
     """
@@ -99,8 +130,6 @@ async def update_document(collection_name: str, filter: dict, update: dict) -> i
     Returns the count of modified documents.
     """
     coll = get_collection(collection_name)
-    # Ensure the update uses operators like $set, $inc, etc.
-    # If 'update' only contains fields, wrap it in $set for safety/clarity
     if not any(key.startswith('$') for key in update):
        update_operation = {'$set': update}
     else:
@@ -120,17 +149,16 @@ async def delete_document(collection_name: str, filter: dict) -> int:
 
 
 # --- File upload/download using GridFS ---
-# These also need the fs_bucket to be initialized
 
 async def upload_file(file_bytes: bytes, filename: str, metadata: dict = None) -> str:
     """
     Upload a file to GridFS. Returns the file ID as string.
     """
-    global fs_bucket
-    if fs_bucket is None:
-         raise RuntimeError("GridFS bucket not initialized.")
+    fs = get_fs_bucket() # Use helper function
     metadata = metadata or {}
-    file_id = await fs_bucket.upload_from_stream(filename, file_bytes, metadata=metadata)
+    # Note: upload_from_stream expects a stream-like object or bytes directly.
+    # If file_bytes is already bytes, this is fine.
+    file_id = await fs.upload_from_stream(filename, file_bytes, metadata=metadata)
     return str(file_id)
 
 async def download_file(file_id) -> bytes:
@@ -138,17 +166,14 @@ async def download_file(file_id) -> bytes:
     Download a file from GridFS by its ID (can be ObjectId or string).
     Returns file bytes.
     """
-    global fs_bucket
-    if fs_bucket is None:
-         raise RuntimeError("GridFS bucket not initialized.")
-    # Convert string ID to ObjectId if necessary
+    fs = get_fs_bucket() # Use helper function
     if isinstance(file_id, str):
         try:
             file_id = ObjectId(file_id)
         except Exception:
              raise ValueError(f"Invalid file_id format: {file_id}")
 
-    grid_out = await fs_bucket.open_download_stream(file_id)
+    grid_out = await fs.open_download_stream(file_id)
     data = await grid_out.read()
     return data
 
@@ -156,13 +181,10 @@ async def delete_file(file_id) -> None:
     """
     Delete a file from GridFS by its ID (can be ObjectId or string).
     """
-    global fs_bucket
-    if fs_bucket is None:
-         raise RuntimeError("GridFS bucket not initialized.")
-    # Convert string ID to ObjectId if necessary
+    fs = get_fs_bucket() # Use helper function
     if isinstance(file_id, str):
         try:
             file_id = ObjectId(file_id)
         except Exception:
              raise ValueError(f"Invalid file_id format: {file_id}")
-    await fs_bucket.delete(file_id)
+    await fs.delete(file_id)

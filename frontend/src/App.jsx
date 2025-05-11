@@ -12,6 +12,7 @@ import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import MemoriesPage from './pages/MemoriesPage';
 import ConversationPage from './pages/ConversationPage';
+import AddMemoryPage from './pages/AddMemoryPage'; // Uncomment if you create this page
 // Import AddMemoryPage if you create it
 
 import './index.css'; // Include global styles
@@ -24,12 +25,14 @@ function App() {
                     {/* Public Routes */}
                     <Route path="/login" element={<LoginPage />} />
                     <Route path="/register" element={<RegisterPage />} />
+                   {/* Uncomment if you create this page */}
 
                     {/* Protected Routes */}
                     <Route element={<ProtectedRoute />}> {/* Routes requiring login */}
                          <Route element={<Layout />}> {/* Optional: Wrap protected pages in a Layout */}
                             <Route path="/" element={<HomePage />} />
                             <Route path="/memories" element={<MemoriesPage />} />
+                            <Route path="/addmemory" element={<AddMemoryPage />} />
                             <Route path="/conversation" element={<ConversationPage />} />
                              {/* <Route path="/memories/add" element={<AddMemoryPage />} /> */}
                              {/* Add other protected routes here */}

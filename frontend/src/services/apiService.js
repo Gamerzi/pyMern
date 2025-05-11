@@ -1,6 +1,4 @@
 // frontend/src/services/apiService.js
-// This code includes the necessary exports for all functions, including uploadMemoryAttachment.
-
 import axios from 'axios';
 
 // Use the backend URL provided by Vite's environment variables or default
@@ -9,16 +7,12 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/
 // Create an axios instance
 const apiClient = axios.create({
     baseURL: API_BASE_URL,
-    headers: {
-        'Content-Type': 'application/json',
-    },
 });
 
 // --- Request Interceptor ---
-// Automatically add the auth token to requests if it exists
 apiClient.interceptors.request.use(
     (config) => {
-        const token = localStorage.getItem('authToken'); // Or get from context/sessionStorage
+        const token = localStorage.getItem('authToken');
         if (token) {
             config.headers['Authorization'] = `Bearer ${token}`;
         }
@@ -38,16 +32,22 @@ export const loginUser = async (username, password) => {
         const response = await apiClient.post('/auth/token', params, {
              headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
         });
+        if (response.data.access_token) {
+             localStorage.setItem('authToken', response.data.access_token);
+        }
         return response.data;
     } catch (error) {
         console.error("Login error:", error.response?.data || error.message);
+        localStorage.removeItem('authToken');
         throw error.response?.data || new Error("Login failed");
     }
 };
 
 export const registerUser = async (userData) => {
     try {
-        const response = await apiClient.post('/auth/register', userData);
+        const response = await apiClient.post('/auth/register', userData, {
+             headers: { 'Content-Type': 'application/json' }
+        });
         return response.data;
     } catch (error) {
         console.error("Registration error:", error.response?.data || error.message);
@@ -60,69 +60,106 @@ export const getCurrentUser = async () => {
         const response = await apiClient.get('/auth/users/me');
         return response.data;
     } catch (error) {
-        console.error("Get user error:", error.response?.data || error.message);
-        return null; // Indicate failure without throwing usually
+        if (error.response?.status === 401) {
+            console.warn("Unauthorized access attempt or token expired.");
+            localStorage.removeItem('authToken');
+        } else {
+            console.error("Get user error:", error.response?.data || error.message);
+        }
+        return null;
     }
 };
-
 
 // --- Memory API Calls ---
 export const getMemories = async (skip = 0, limit = 20) => {
     try {
-        const response = await apiClient.get(`/memories/?skip=${skip}&limit=${limit}`);
+        // FIXED: Removed trailing slash before query parameters
+        const response = await apiClient.get(`/memories?skip=${skip}&limit=${limit}`);
+        console.log("apiService.getMemories - Response Data:", response.data); // Log received data
         return response.data;
     } catch (error) {
-        console.error("Get memories error:", error.response?.data || error.message);
+        console.error("apiService.js Get memories error:", error.response?.data || error.message, error);
         throw error.response?.data || new Error("Failed to fetch memories");
     }
 };
 
-export const createMemory = async (memoryData) => {
+export const createMemory = async (formData) => {
+    if (!(formData instanceof FormData)) {
+         console.error("createMemory expects FormData as input when sending files.");
+         throw new Error("Invalid data format for createMemory");
+    }
     try {
-        const response = await apiClient.post('/memories/', memoryData);
+        // FIXED: Removed trailing slash from URL
+        const response = await apiClient.post('/memories', formData, {
+            headers: {
+                'Content-Type': 'multipart/form-data',
+            },
+        });
         return response.data;
     } catch (error) {
-        console.error("Create memory error:", error.response?.data || error.message);
+        console.error("Create memory error in apiService:", error.response?.data || error.message);
+        if (error.response) {
+            console.error("Error details from createMemory:", error.response);
+        }
         throw error.response?.data || new Error("Failed to create memory");
     }
 };
 
 export const updateMemory = async (memoryId, memoryData) => {
     try {
-        const response = await apiClient.patch(`/memories/${memoryId}`, memoryData);
+        // Ensure memoryId is not undefined before making the call
+        if (memoryId === undefined || memoryId === null) {
+            console.error("updateMemory: memoryId is undefined or null.");
+            throw new Error("Memory ID is required for update.");
+        }
+        // FIXED: Removed trailing slash from URL
+        const response = await apiClient.patch(`/memories/${memoryId}`, memoryData, {
+             headers: { 'Content-Type': 'application/json' }
+        });
         return response.data;
     } catch (error) {
-        console.error("Update memory error:", error.response?.data || error.message);
+        console.error("Update memory error in apiService:", error.response?.data || error.message, error);
         throw error.response?.data || new Error("Failed to update memory");
     }
 };
 
 export const deleteMemory = async (memoryId) => {
     try {
-        await apiClient.delete(`/memories/${memoryId}`);
-        return true;
+        // Ensure memoryId is not undefined before making the call
+        if (memoryId === undefined || memoryId === null) {
+            console.error("deleteMemory: memoryId is undefined or null. URL would be invalid.");
+            throw new Error("Memory ID is required for deletion."); // Prevent call with /undefined
+        }
+        // FIXED: Removed trailing slash from URL
+        const response = await apiClient.delete(`/memories/${memoryId}`);
+        // For DELETE, a 204 No Content is common, response.data might be empty or undefined
+        // Return a success indicator or rely on status code handling in the calling component
+        return { success: true, status: response.status };
     } catch (error) {
-        console.error("Delete memory error:", error.response?.data || error.message);
+        console.error("Delete memory error in apiService:", error.response?.data || error.message, error);
         throw error.response?.data || new Error("Failed to delete memory");
     }
 };
 
-// Correctly exported function
 export const uploadMemoryAttachment = async (memoryId, file) => {
     const formData = new FormData();
-    formData.append('file', file); // 'file' must match backend parameter name
+    formData.append('file', file);
 
     try {
-        // NOTE: Backend endpoint /upload doesn't exist yet! This call will fail until backend is updated.
-        const response = await apiClient.post(`/memories/${memoryId}/upload`, formData, {
+        if (memoryId === undefined || memoryId === null) {
+            console.error("uploadMemoryAttachment: memoryId is undefined or null.");
+            throw new Error("Memory ID is required for attachment upload.");
+        }
+        // FIXED: Removed trailing slash and ensured endpoint matches backend if it's like "/memories/{id}/upload-attachment"
+        // Assuming backend endpoint is /memories/{memoryId}/upload-attachment
+        const response = await apiClient.post(`/memories/${memoryId}/upload-attachment`, formData, {
             headers: {
-                'Content-Type': 'multipart/form-data', // Important for file uploads
+                'Content-Type': 'multipart/form-data',
             },
         });
-        return response.data; // Expect backend to return updated memory or attachment info
+        return response.data;
     } catch (error) {
-         console.error("Upload attachment error:", error.response?.data || error.message);
-         // Add specific user feedback if possible (e.g., file too large)
+         console.error("Upload attachment error in apiService:", error.response?.data || error.message, error);
         throw error.response?.data || new Error("Failed to upload attachment");
     }
 };
@@ -130,7 +167,10 @@ export const uploadMemoryAttachment = async (memoryId, file) => {
 // --- Conversation API Calls ---
 export const startConversation = async (initialMessage) => {
      try {
-        const response = await apiClient.post('/conversations/', { initial_message: initialMessage });
+        // FIXED: Removed trailing slash from URL
+        const response = await apiClient.post('/conversations', { initial_message: initialMessage }, {
+             headers: { 'Content-Type': 'application/json' }
+        });
         return response.data;
     } catch (error) {
         console.error("Start conversation error:", error.response?.data || error.message);
@@ -140,7 +180,10 @@ export const startConversation = async (initialMessage) => {
 
 export const sendMessage = async (conversationId, messageContent) => {
     try {
-        const response = await apiClient.post(`/conversations/${conversationId}/messages`, { content: messageContent });
+        // FIXED: Removed trailing slash from URL
+        const response = await apiClient.post(`/conversations/${conversationId}/messages`, { content: messageContent }, {
+             headers: { 'Content-Type': 'application/json' }
+        });
         return response.data;
     } catch (error) {
         console.error("Send message error:", error.response?.data || error.message);
@@ -148,5 +191,4 @@ export const sendMessage = async (conversationId, messageContent) => {
     }
 };
 
-// Optional: export the configured client if needed elsewhere
 export default apiClient;

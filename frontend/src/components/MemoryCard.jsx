@@ -1,143 +1,162 @@
-// frontend/src/components/MemoryCard.jsx
 import React from 'react';
+import PropTypes from 'prop-types';
+import './MemoryCard.css';
 
-// Pass onDelete and onEdit props from the parent (MemoriesPage)
+// Helper to format date
+const formatDate = (dateString) => {
+    if (!dateString) return 'N/A';
+    try {
+        return new Date(dateString).toLocaleDateString(undefined, {
+            year: 'numeric', month: 'short', day: 'numeric'
+        });
+    } catch (e) {
+        return "Invalid Date";
+    }
+};
+
+// Check if attachment URL points to an image
+const isImageUrl = (url) => {
+    if (typeof url !== 'string') return false;
+    return /\.(jpe?g|png|gif|webp|svg)$/i.test(url);
+};
+
+// Truncate text with ellipsis
+const truncateText = (text, maxLength) => {
+    if (!text) return '';
+    return text.length > maxLength ? `${text.substring(0, maxLength - 3)}...` : text;
+};
+
 function MemoryCard({ memory, onDelete, onEdit }) {
-    if (!memory) return null;
-
-    // --- Basic Styling ---
-    const cardStyle = {
-        border: '1px solid var(--border-light, #ddd)', // Use CSS var
-        borderRadius: '8px',
-        padding: '15px',
-        marginBottom: '15px',
-        backgroundColor: 'var(--card-bg-light, #fff)', // Use CSS var
-        boxShadow: '0 2px 4px rgba(0,0,0,0.05)', // Softer shadow
-        color: 'var(--text-light, #212529)', // Ensure text color uses variable
-    };
-    const tagStyle = {
-        display: 'inline-block',
-        backgroundColor: '#e9ecef', // Lighter tag bg
-        color: '#495057', // Darker tag text
-        padding: '3px 8px',
-        borderRadius: '12px',
-        marginRight: '5px',
-        marginBottom: '5px',
-        fontSize: '0.9em'
-    };
-    const buttonStyle = { // Style for edit/delete buttons
-        padding: '4px 8px',
-        fontSize: '0.9em',
-        marginLeft: '10px',
-        cursor: 'pointer',
-        border: '1px solid transparent',
-        borderRadius: '4px',
-    };
-    const editButtonStyle = {
-         ...buttonStyle,
-         backgroundColor: '#cfe2ff', // Light blue accent
-         color: '#0a58ca',
-         borderColor: '#b6d4fe',
-    };
-    const deleteButtonStyle = {
-         ...buttonStyle,
-         backgroundColor: '#f8d7da', // Light red accent
-         color: '#842029',
-         borderColor: '#f5c2c7',
-    };
-     const attachmentListStyle = {
-        listStyle: 'none',
-        padding: 0,
-        marginTop: '5px',
-    };
-    const attachmentItemStyle = {
-        fontSize: '0.9em',
-        marginBottom: '3px',
-    };
-    const attachmentLinkStyle = {
-        color: 'var(--accent-light, #007bff)', // Use CSS var
-        textDecoration: 'none',
-    };
-    const attachmentImageStyle = {
-        maxWidth: '100px',
-        maxHeight: '100px',
-        marginTop: '5px',
-        display: 'block',
-        borderRadius: '4px',
-    };
-    // ---------------------
-
-    const formatDate = (dateString) => {
-       // ... (same as before) ...
+    // Handle missing memory data
+    if (!memory || !memory.id) {
+        return (
+            <div className="memory-card memory-card-error">
+                <p>Memory data is unavailable.</p>
+            </div>
+        );
     }
 
-    const handleDeleteClick = () => {
-        if (window.confirm(`Are you sure you want to delete the memory "${memory.title}"?`)) {
-            onDelete(memory.id); // Call the prop function passed from parent
+    const {
+        id, title, description, significance, tags, attachments, created_at,
+    } = memory;
+
+    const handleDeleteClick = (e) => {
+        e.stopPropagation();
+        if (id && window.confirm(`Are you sure you want to delete "${title || 'this memory'}"?`)) {
+            onDelete(id);
         }
     };
 
-    const handleEditClick = () => {
-        onEdit(memory); // Pass the whole memory object to the edit handler
+    const handleEditClick = (e) => {
+        e.stopPropagation();
+        if (memory && memory.id) {
+            onEdit(memory);
+        }
     };
 
-    // Simple check if attachment is an image based on common extensions
-    const isImage = (filename) => /\.(jpe?g|png|gif|webp|svg)$/i.test(filename);
+    const hasTags = tags && Array.isArray(tags) && tags.length > 0;
+    const hasAttachments = attachments && Array.isArray(attachments) && attachments.length > 0;
 
     return (
-        <div style={cardStyle}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                <div>
-                    <h3>{memory.title || 'Untitled Memory'}</h3>
-                    <p style={{ marginTop: '-0.5em', fontSize: '0.9em', color: '#6c757d' }}>
-                        Date: {formatDate(memory.event_date)} | Significance: {'⭐'.repeat(memory.significance || 0)}
-                    </p>
+        <div className="memory-card">
+            <div className="memory-card-content">
+                <div className="memory-card-header">
+                    <h3 className="memory-card-title">{title || "Untitled Memory"}</h3>
+                    {significance !== undefined && (
+                        <div className="memory-card-significance" title={`Significance: ${significance}/5`}>
+                            {Array.from({ length: 5 }, (_, i) => (
+                                <span
+                                    key={`star-${id}-${i}`}
+                                    className={i < significance ? 'star-filled' : 'star-empty'}
+                                >
+                                    ★
+                                </span>
+                            ))}
+                        </div>
+                    )}
                 </div>
-                {/* Edit/Delete Buttons */}
-                <div>
-                    <button onClick={handleEditClick} style={editButtonStyle} title="Edit Memory">Edit</button>
-                    <button onClick={handleDeleteClick} style={deleteButtonStyle} title="Delete Memory">Delete</button>
-                </div>
+
+                <p className="memory-card-description">
+                    {description ? truncateText(description, 150) : <em>No description provided.</em>}
+                </p>
+
+                {hasTags && (
+                    <div className="memory-card-tags">
+                        {tags.map((tag, index) => (
+                            <span key={`tag-${id}-${index}`} className="tag-chip">
+                                {tag}
+                            </span>
+                        ))}
+                    </div>
+                )}
+
+                {hasAttachments && (
+                    <div className="memory-card-attachments">
+                        <strong>Attachments:</strong>
+                        <ul className="attachments-list">
+                            {attachments.map((attachmentUrl, index) => {
+                                const attachmentName = typeof attachmentUrl === 'string' 
+                                    ? attachmentUrl.split('/').pop() 
+                                    : `attachment-${index}`;
+                                
+                                return (
+                                    <li key={`attachment-${id}-${index}`} className="attachment-list-item">
+                                        {isImageUrl(attachmentUrl) ? (
+                                            <a 
+                                                href={attachmentUrl} 
+                                                target="_blank" 
+                                                rel="noopener noreferrer" 
+                                                title={`View ${attachmentName}`}
+                                            >
+                                                <img 
+                                                    src={attachmentUrl} 
+                                                    alt={attachmentName || 'Attachment'} 
+                                                    className="attachment-thumbnail" 
+                                                />
+                                            </a>
+                                        ) : (
+                                            <a 
+                                                href={attachmentUrl || '#'} 
+                                                target="_blank" 
+                                                rel="noopener noreferrer" 
+                                                className="attachment-link"
+                                            >
+                                                {attachmentName}
+                                            </a>
+                                        )}
+                                    </li>
+                                );
+                            })}
+                        </ul>
+                    </div>
+                )}
             </div>
 
-            <p style={{ whiteSpace: 'pre-wrap', marginTop: '10px' }}>{memory.description || 'No description.'}</p>
-
-            {/* Tags */}
-            {memory.tags && memory.tags.length > 0 && (
-                <div style={{ marginTop: '10px' }}>
-                    <strong>Tags:</strong>
-                    {memory.tags.map((tag, index) => (
-                        <span key={index} style={tagStyle}>{tag}</span>
-                    ))}
+            <div className="memory-card-footer">
+                <small className="memory-card-date">
+                    Created: {formatDate(created_at)}
+                </small>
+                <div className="memory-card-actions">
+                    <button onClick={handleEditClick} className="button-edit">Edit</button>
+                    <button onClick={handleDeleteClick} className="button-delete">Delete</button>
                 </div>
-            )}
-
-            {/* Attachments */}
-            {memory.attachments && memory.attachments.length > 0 && (
-                <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px dashed #eee' }}>
-                    <strong>Attachments:</strong>
-                    <ul style={attachmentListStyle}>
-                        {memory.attachments.map((att, index) => (
-                            <li key={index} style={attachmentItemStyle}>
-                                {att.url && isImage(att.filename || '') ? (
-                                    // Display image thumbnail if it's an image
-                                    <a href={att.url} target="_blank" rel="noopener noreferrer" title={`View ${att.filename}`}>
-                                        <img src={att.url} alt={att.filename || 'Attachment'} style={attachmentImageStyle} />
-                                    </a>
-                                ) : (
-                                    // Link for non-image files
-                                    <a href={att.url || '#'} target="_blank" rel="noopener noreferrer" style={attachmentLinkStyle}>
-                                        {att.filename || 'Unnamed File'}
-                                    </a>
-                                )}
-                                {att.size && ` (${Math.round(att.size / 1024)} KB)`}
-                             </li>
-                        ))}
-                    </ul>
-                </div>
-            )}
+            </div>
         </div>
     );
 }
+
+MemoryCard.propTypes = {
+    memory: PropTypes.shape({
+        id: PropTypes.string.isRequired,
+        title: PropTypes.string,
+        description: PropTypes.string,
+        significance: PropTypes.number,
+        tags: PropTypes.arrayOf(PropTypes.string),
+        attachments: PropTypes.arrayOf(PropTypes.string),
+        created_at: PropTypes.string,
+    }).isRequired,
+    onDelete: PropTypes.func.isRequired,
+    onEdit: PropTypes.func.isRequired,
+};
 
 export default MemoryCard;

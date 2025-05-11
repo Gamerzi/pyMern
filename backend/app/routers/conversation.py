@@ -2,24 +2,50 @@
 
 import os
 import uuid
-import asyncio # Needed for placeholder simulation and potentially real async tasks
+import asyncio
+import logging
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Body
-from pydantic import BaseModel, Field
-from groq import Groq, AsyncGroq # Import Groq SDK
+# --- CORRECTED IMPORT: Added Query ---
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
+# --- END CORRECTION ---
 
+from pydantic import BaseModel, Field, VERSION as PYDANTIC_VERSION
+from groq import Groq, AsyncGroq
+from motor.motor_asyncio import AsyncIOMotorDatabase, AsyncIOMotorCollection
 
-# --- Environment Variable Loading (Best done in main.py or config module) ---
-# from dotenv import load_dotenv
-# load_dotenv(dotenv_path="../../config/.env") # Adjust path as needed
-# Ensure GROQ_API_KEY is set in your .env file
+# --- Logger ---
+logger = logging.getLogger(__name__)
+# logging.basicConfig(level=logging.INFO) # Configure in main.py
 
-# --- Pydantic Models (Ideally in app/models/conversation.py) ---
+# --- REAL Dependency Imports ---
+try:
+    from ..main import get_db, get_current_active_user, UserPublic
+    User = UserPublic
+    logger.info("conversations.py: Successfully imported REAL dependencies from ..main.")
+except ImportError as e:
+    logger.critical(
+        f"conversations.py: CRITICAL ERROR - FAILED to import REAL dependencies from ..main: {e}. "
+        "This router WILL NOT function with actual DB or Auth. Using placeholders.",
+        exc_info=True
+    )
+    class User(BaseModel): id: str = "placeholder_conv_id"; username: str = "placeholder_conv_user"
+    async def get_db() -> AsyncIOMotorDatabase:
+        logger.error("conversations.py: FATAL - Using PLACEHOLDER get_db().")
+        raise NotImplementedError("Placeholder get_db() called. Real 'get_db' failed to import.")
+    async def get_current_active_user() -> User:
+        logger.error("conversations.py: FATAL - Using PLACEHOLDER get_current_active_user().")
+        raise NotImplementedError("Placeholder get_current_active_user() called. Real 'get_current_active_user' failed to import.")
+
+# --- Configuration for MongoDB Collections ---
+CONVERSATIONS_COLLECTION_NAME = "conversations_collection"
+MEMORIES_COLLECTION_NAME_FOR_CONTEXT = "futureself"
+
+# --- Pydantic Models ---
 class Message(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    role: str  # "user", "assistant" (standard for LLMs), or "future_self" if you map it
+    role: str
     content: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
@@ -27,343 +53,274 @@ class ConversationBase(BaseModel):
     user_id: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
-    # title: Optional[str] = None
+    title: Optional[str] = None
 
-class Conversation(ConversationBase):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+class ConversationInDB(ConversationBase):
+    id: str = Field(alias="_id")
     messages: List[Message] = []
+    class Config: from_attributes = True; populate_by_name = True
+
+class ConversationResponse(ConversationBase):
+    id: str
+    messages: List[Message] = []
+    class Config: from_attributes = True
 
 class ConversationCreateRequest(BaseModel):
     initial_message: str
+    title: Optional[str] = None
 
 class SendMessageRequest(BaseModel):
     content: str
 
-# --- Placeholder Dependencies ---
-async def get_db():
-    print("DEBUG: Yielding dummy DB connection")
-    yield {"conversations": {}, "users": {}} # Dummy store
-
-class User(BaseModel): # Placeholder User model
-    id: str
-    username: str
-    # IMPORTANT: Store user's explicit consent for data processing, especially PHI
-    # has_consented_to_phi_processing: bool = False
-
-async def get_current_active_user(db = Depends(get_db)) -> User:
-    print("DEBUG: Returning dummy authenticated user")
-    # !! Replace with actual authentication and user loading !!
-    # !! Ensure loaded user includes consent status if handling PHI !!
-    return User(id="user_123", username="testuser") # Add consent flag if needed
-
-
-# --- Persona Service with Groq Integration ---
-
+# --- Persona Service with Groq Integration AND MEMORY FETCHING ---
 class PersonaService:
-    """
-    Service interacting with the Groq LLM and managing persona logic.
+    def __init__(self, db: AsyncIOMotorDatabase):
+        self.db = db
+        
+        # --- !!! HARDCODED API KEY FOR TESTING !!! ---
+        # --- !!! REMOVE THIS AND REVERT AFTER TESTING !!! ---
+        self.groq_api_key = "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" # YOUR HARDCODED KEY
+        logger.warning("!!! conversations.py WARNING: GROQ_API_KEY IS CURRENTLY HARDCODED IN PersonaService FOR TESTING !!!")
+        # --- !!! END OF HARDCODED SECTION !!! ---
 
-    WARNING: Handles potentially sensitive user data (including PHI if entered).
-    Ensure compliance with regulations (e.g., HIPAA) and Groq's data policies
-    BEFORE sending PHI to the Groq API. Standard Groq APIs are likely NOT compliant.
-    Obtain EXPLICIT user consent.
-    """
-    def __init__(self, db):
-        self.db = db # Used to fetch user memories, profile, etc.
-        self.groq_api_key = os.getenv("GROQ_API_KEY")
         if not self.groq_api_key:
-            # Critical: Do not proceed without API key configuration
-            raise ValueError("GROQ_API_KEY environment variable not set.")
-        # Use AsyncGroq for FastAPI compatibility
-        self.groq_client = AsyncGroq(api_key=self.groq_api_key)
-        # Consider making the model configurable
-        self.model_name = "llama3-8b-8192" # Example model, choose based on availability/needs
+            logger.critical("GROQ_API_KEY is unexpectedly empty even after hardcoding.")
+            raise ValueError("CRITICAL: GROQ_API_KEY is not configured (hardcoding failed).")
+        
+        logger.info(f"PersonaService: Using hardcoded GROQ_API_KEY: "
+                    f"{self.groq_api_key[:7]}...{self.groq_api_key[-4:]}")
 
-    async def _fetch_user_context(self, user: User) -> str:
-        """
-        Placeholder: Fetches relevant user memories and profile info from DB.
-        Formats it into a string suitable for the LLM prompt preamble.
-        !! CRITICAL: Filter/anonymize sensitive PHI here if possible,
-        !! or ensure user consent covers sending raw data.
-        """
-        # Example: Fetching simplified memories (replace with real DB query)
-        # user_memories = await db_get_user_memories(self.db, user.id, limit=10)
-        # memory_summary = " Key memories: " + "; ".join([m.summary for m in user_memories])
-        # profile_summary = f" User values: {user.values}" # Assuming user has values stored
-        # return profile_summary + memory_summary
-        await asyncio.sleep(0.05) # Simulate DB lookup
-        return f"Some context about {user.username} based on their stored memories and profile will be inserted here. Focus on wisdom and perspective."
+        try:
+            self.groq_client = AsyncGroq(api_key=self.groq_api_key)
+        except Exception as e:
+            logger.error(f"Failed to initialize Groq client with hardcoded key: {e}", exc_info=True)
+            raise RuntimeError(f"Could not initialize Groq client: {e}")
+            
+        self.model_name = os.getenv("GROQ_MODEL_NAME", "llama3-8b-8192") # Still get model from env or default
+        # Or hardcode for test: self.model_name = "llama3-8b-8192"
+        logger.info(f"PersonaService: Using model '{self.model_name}'.")
 
+
+    async def _fetch_user_memories_for_context(self, user: User, limit: int = 5) -> str:
+        logger.info(f"Fetching memories for user '{user.id}' from '{MEMORIES_COLLECTION_NAME_FOR_CONTEXT}' collection.")
+        if not isinstance(self.db, AsyncIOMotorDatabase): # Check if we have a real DB object
+            logger.warning(f"PersonaService._fetch_user_memories_for_context using non-DB object (type: {type(self.db)}). Likely placeholder. Returning no memory context.")
+            return "No specific memories available for context (using placeholder database)."
+
+        memories_collection: AsyncIOMotorCollection = self.db[MEMORIES_COLLECTION_NAME_FOR_CONTEXT]
+        try:
+            cursor = memories_collection.find({"user_id": user.id}).sort("created_at", -1).limit(limit)
+            user_memories_docs = await cursor.to_list(length=limit)
+            if not user_memories_docs:
+                logger.info(f"No memories found for user '{user.id}' in '{MEMORIES_COLLECTION_NAME_FOR_CONTEXT}'.")
+                return "User has not recorded specific memories relevant to this discussion yet."
+            formatted_memories = []
+            for i, mem_doc in enumerate(user_memories_docs):
+                title = mem_doc.get("title", "Untitled Memory")
+                description = mem_doc.get("description", "")
+                description_snippet = (description[:100] + '...') if len(description) > 103 else description
+                tags = ", ".join(mem_doc.get("tags", []))
+                formatted_memories.append(
+                    f"  Memory {i+1}: '{title}' (Tags: {tags if tags else 'None'}). Snippet: \"{description_snippet}\""
+                )
+            memory_summary = "\nHere are some relevant past memories to consider:\n" + "\n".join(formatted_memories)
+            logger.info(f"Formatted memory context for user '{user.id}': {memory_summary[:200]}...")
+            return memory_summary
+        except Exception as e:
+            logger.error(f"Error fetching memories for user '{user.id}': {e}", exc_info=True)
+            return "There was an issue recalling specific memories at this time."
 
     async def _generate_response(self, user: User, conversation_history: List[Message]) -> str:
-        """Generates a response using the Groq LLM."""
-
-        # 1. Fetch additional user context (memories, profile)
-        user_context = await self._fetch_user_context(user)
-
-        # 2. Construct the System Prompt (Persona Definition)
-        # This is crucial for maintaining the "60-year-old self" persona
+        memory_context = await self._fetch_user_memories_for_context(user)
         system_prompt = f"""You are an AI simulating the 60-year-old version of the user '{user.username}'.
-Act as a wise, reflective, and kind future self, offering perspective based on a lifetime of experience (informed by the user's actual stored memories and profile, provided below).
+Act as a wise, reflective, and kind future self, offering perspective based on a lifetime of experience.
+Your insights should be informed by the user's actual stored memories and profile, provided below if available.
 Do NOT give medical, legal, or financial advice. Focus on emotional insight, long-term perspective, and gentle guidance.
 Keep your persona consistent. Refer to the user in the second person (you).
-User context: {user_context}
 
-VERY IMPORTANT: Do not provide medical diagnoses or treatment recommendations, even if the user mentions health issues. You can acknowledge their feelings but redirect to seeking professional medical help.
+User's Past Memories Context:
+{memory_context}
+
+VERY IMPORTANT: Do not provide medical diagnoses or treatment recommendations. Acknowledge feelings but redirect to professionals for health concerns.
 """
-
-        # 3. Format conversation history for the LLM API
-        # Groq expects roles like "user" and "assistant". Map "future_self" to "assistant".
         messages_for_api = [{"role": "system", "content": system_prompt}]
         for msg in conversation_history:
             role = "assistant" if msg.role == "future_self" else msg.role
             messages_for_api.append({"role": role, "content": msg.content})
-
-        # 4. Call Groq API
+        
+        logger.debug(f"Calling Groq API for user '{user.id}'. Model: {self.model_name}. System prompt includes memory context.")
         try:
             chat_completion = await self.groq_client.chat.completions.create(
-                messages=messages_for_api,
-                model=self.model_name,
-                temperature=0.7, # Adjust creativity/determinism
-                max_tokens=300, # Limit response length
-                # Add other parameters as needed (top_p, etc.)
+                messages=messages_for_api, model=self.model_name, temperature=0.7, max_tokens=450,
             )
-            response_content = chat_completion.choices[0].message.content
-
-            # 5. Post-processing (Optional but recommended)
-            # - Check for harmful content (though Groq might have filters)
-            # - Add a standard disclaimer if sensitive topics were discussed
-            # - Ensure persona consistency (though the system prompt helps)
-            if "doctor" in response_content or "medical advice" in response_content: # Basic check
-                 response_content += "\n\n(Remember, I am an AI and cannot provide medical advice. Please consult a healthcare professional for health concerns.)"
-
-            return response_content.strip()
-
+            response_content = chat_completion.choices[0].message.content.strip()
+            return response_content
         except Exception as e:
-            # Log the specific error from Groq or network issues
-            print(f"Error calling Groq API: {e}")
-            # Consider more specific error handling based on Groq exceptions
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Could not get response from Future Self AI service due to: {e}"
-            )
+            error_message = f"Error with AI service (Groq)."; status_code_to_raise = status.HTTP_503_SERVICE_UNAVAILABLE
+            if hasattr(e, 'status_code'): status_code_to_raise = e.status_code; error_message = f"AI service error (Status {e.status_code})"
+            if hasattr(e, 'message'): error_message += f": {e.message}"
+            elif hasattr(e, 'body') and e.body and 'error' in e.body: error_message += f": {e.body['error'].get('message', str(e.body['error']))}"
+            else: error_message += f": {str(e)}"
+            if hasattr(e, 'status_code') and e.status_code == 401: logger.error(f"CRITICAL GROQ API ERROR: 401. Detail: {error_message}"); error_message = "AI service authentication failed: Invalid API Key."
+            logger.error(f"Groq API call failed: {error_message}", exc_info=True)
+            raise HTTPException(status_code=status_code_to_raise if not (hasattr(e, 'status_code') and e.status_code == 401) else status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_message)
 
-
-    async def get_initial_response(self, user: User, first_message: str) -> str:
-        """Generates the first 'future self' response using Groq."""
-        print(f"DEBUG: PersonaService generating initial Groq response for user {user.id}")
-        # History contains only the first user message
-        initial_history = [Message(role="user", content=first_message)]
+    async def get_initial_response(self, user: User, first_message_content: str) -> str:
+        initial_history = [Message(role="user", content=first_message_content)]
         return await self._generate_response(user, initial_history)
 
     async def get_next_response(self, user: User, conversation_history: List[Message]) -> str:
-        """Generates the next 'future self' response using Groq based on history."""
-        print(f"DEBUG: PersonaService generating next Groq response for user {user.id}")
-        # Ensure history isn't excessively long (implement truncation if needed)
-        # Simple truncation: keep last N messages (e.g., 10)
-        max_history_len = 10
-        truncated_history = conversation_history[-max_history_len:]
+        max_history_messages = 10
+        truncated_history = conversation_history[-max_history_messages:] if len(conversation_history) > max_history_messages else conversation_history
         return await self._generate_response(user, truncated_history)
-
 
 # --- FastAPI Router ---
 router = APIRouter(
-    prefix="/conversations",
     tags=["Conversations"],
-    responses={404: {"description": "Not found"}},
+    responses={404: {"description": "Conversation resource not found"}},
+    dependencies=[Depends(get_current_active_user)]
 )
 
-# --- Database Simulation Helpers (Replace with actual DB logic) ---
-async def db_create_conversation(db, conversation: Conversation) -> Conversation:
-    if "conversations" not in db: db["conversations"] = {}
-    db["conversations"][conversation.id] = conversation.dict()
-    print(f"DEBUG: DB creating conversation {conversation.id}")
-    return conversation
+# --- Database Interaction Helpers for Conversations ---
+async def db_create_conversation(db: AsyncIOMotorDatabase, conversation: ConversationInDB) -> ConversationInDB:
+    logger.info(f"Creating new conversation '{conversation.id}' for user '{conversation.user_id}' in DB.")
+    if not isinstance(db, AsyncIOMotorDatabase):
+        logger.error("db_create_conversation: `db` is not AsyncIOMotorDatabase. Placeholder active.")
+        raise HTTPException(status_code=500, detail="DB service misconfigured for conversation creation.")
+    try:
+        conversations_collection: AsyncIOMotorCollection = db[CONVERSATIONS_COLLECTION_NAME]
+        doc_to_insert = conversation.model_dump(by_alias=True) if hasattr(conversation, "model_dump") else conversation.dict(by_alias=True)
+        insert_result = await conversations_collection.insert_one(doc_to_insert)
+        if not insert_result.inserted_id:
+            logger.error(f"Failed to insert conversation '{conversation.id}' into DB.")
+            raise HTTPException(status_code=500, detail="Could not save new conversation.")
+        created_doc = await conversations_collection.find_one({"_id": insert_result.inserted_id})
+        if not created_doc:
+            logger.error(f"Failed to retrieve conversation '{conversation.id}' after insert.")
+            raise HTTPException(status_code=500, detail="Error retrieving conversation post-creation.")
+        return ConversationInDB(**created_doc)
+    except Exception as e:
+        logger.error(f"DB error creating conversation '{conversation.id}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="DB error during conversation creation.")
 
-async def db_get_conversation(db, conversation_id: str, user_id: str) -> Optional[Conversation]:
-    print(f"DEBUG: DB fetching conversation {conversation_id} for user {user_id}")
-    conv_data = db.get("conversations", {}).get(conversation_id)
-    # --- IMPORTANT: Ensure user owns the conversation ---
-    if conv_data and conv_data["user_id"] == user_id:
-        # Convert roles back if needed, though storing as user/assistant might be simpler
-        return Conversation(**conv_data)
-    return None
+async def db_get_conversation(db: AsyncIOMotorDatabase, conversation_id: str, user_id: str) -> Optional[ConversationInDB]:
+    logger.debug(f"Fetching conversation '{conversation_id}' for user '{user_id}'.")
+    if not isinstance(db, AsyncIOMotorDatabase):
+        logger.error("db_get_conversation: `db` is not AsyncIOMotorDatabase. Placeholder active.")
+        return None
+    try:
+        conversations_collection: AsyncIOMotorCollection = db[CONVERSATIONS_COLLECTION_NAME]
+        conv_doc = await conversations_collection.find_one({"_id": conversation_id, "user_id": user_id})
+        return ConversationInDB(**conv_doc) if conv_doc else None
+    except Exception as e:
+        logger.error(f"DB error fetching conversation '{conversation_id}': {e}", exc_info=True)
+        return None
 
-async def db_update_conversation(db, conversation: Conversation) -> Conversation:
-    if "conversations" not in db: db["conversations"] = {}
-    conversation.updated_at = datetime.utcnow()
-    # --- Store messages with consistent roles (user/assistant) ---
-    # You might want to persist the 'future_self' role or map it consistently
-    db["conversations"][conversation.id] = conversation.dict()
-    print(f"DEBUG: DB updating conversation {conversation.id}")
-    return conversation
-
-async def db_get_user_conversations(db, user_id: str, skip: int = 0, limit: int = 100) -> List[Conversation]:
-    print(f"DEBUG: DB fetching conversations for user {user_id} (skip={skip}, limit={limit})")
-    all_convs = [
-        Conversation(**data) for data in db.get("conversations", {}).values()
-        if data["user_id"] == user_id
-    ]
-    all_convs.sort(key=lambda c: c.updated_at, reverse=True)
-    return all_convs[skip : skip + limit]
+async def db_update_conversation(db: AsyncIOMotorDatabase, conversation: ConversationInDB) -> ConversationInDB:
+    logger.info(f"Updating conversation '{conversation.id}' for user '{conversation.user_id}'.")
+    if not isinstance(db, AsyncIOMotorDatabase):
+        logger.error("db_update_conversation: `db` is not AsyncIOMotorDatabase. Placeholder active.")
+        raise HTTPException(status_code=500, detail="DB service misconfigured for conversation update.")
+    try:
+        conversations_collection: AsyncIOMotorCollection = db[CONVERSATIONS_COLLECTION_NAME]
+        conversation.updated_at = datetime.utcnow()
+        doc_to_update = conversation.model_dump(by_alias=True) if hasattr(conversation, "model_dump") else conversation.dict(by_alias=True)
+        update_result = await conversations_collection.replace_one(
+            {"_id": conversation.id, "user_id": conversation.user_id}, doc_to_update
+        )
+        if update_result.matched_count == 0:
+            logger.warning(f"Conversation '{conversation.id}' not found or user mismatch during update.")
+            raise HTTPException(status_code=404, detail="Conversation not found or access denied for update.")
+        updated_doc = await conversations_collection.find_one({"_id": conversation.id})
+        if not updated_doc:
+            logger.error(f"Failed to retrieve conversation '{conversation.id}' after update.")
+            raise HTTPException(status_code=500, detail="Error retrieving conversation post-update.")
+        return ConversationInDB(**updated_doc)
+    except Exception as e:
+        logger.error(f"DB error updating conversation '{conversation.id}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="DB error during conversation update.")
 
 # --- API Endpoints ---
-
-@router.post(
-    "/",
-    response_model=Conversation,
-    status_code=status.HTTP_201_CREATED,
-    summary="Start a new conversation",
-    description="Creates a new conversation session and gets the first response from the Groq-powered future self.",
-)
-async def start_conversation(
-    request: ConversationCreateRequest = Body(...),
-    db = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+@router.post("/conversations", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED, summary="Start a new conversation")
+async def start_new_conversation(
+    request_body: ConversationCreateRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db), current_user: User = Depends(get_current_active_user),
 ):
-    """
-    Starts a new conversation thread using Groq LLM.
-
-    - Takes the user's first message.
-    - **WARNING:** User input might contain sensitive data (PHI). Ensure user consent
-      and compliance before processing and sending data to Groq.
-    - Creates a conversation record.
-    - Generates the initial 'future self' response via PersonaService/Groq.
-    - Returns the conversation including the initial messages.
-    """
-    # --- !! PHI Consent Check !! ---
-    # if current_user.might_input_phi and not current_user.has_consented_to_phi_processing:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_403_FORBIDDEN,
-    #         detail="User consent required for processing potentially sensitive data."
-    #     )
-
-    persona_service = PersonaService(db) # Instantiate service
-
-    user_message = Message(role="user", content=request.initial_message)
-    new_conversation = Conversation(user_id=current_user.id, messages=[user_message])
-
+    logger.info(f"API: User '{current_user.id}' starting new conversation. Title: '{request_body.title}'.")
     try:
-        future_self_content = await persona_service.get_initial_response(
-            user=current_user, first_message=user_message.content
-        )
-    except HTTPException as http_exc: # Catch exceptions from PersonaService
-        raise http_exc
-    except Exception as e:
-        print(f"Unhandled error getting initial AI response: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error generating response.")
+        persona_service = PersonaService(db)
+    except ValueError as e: raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except RuntimeError as e: raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
 
-    # Store the AI response with a consistent role, e.g., "assistant" or your custom "future_self"
-    future_self_message = Message(role="future_self", content=future_self_content) # Or "assistant"
-    new_conversation.messages.append(future_self_message)
-    new_conversation.updated_at = future_self_message.timestamp
-
+    user_message = Message(role="user", content=request_body.initial_message)
+    conversation_id = str(uuid.uuid4())
+    new_conv_data = ConversationInDB(
+        _id=conversation_id, user_id=current_user.id, messages=[user_message],
+        title=request_body.title or f"Conversation {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+    )
     try:
-        created_conversation = await db_create_conversation(db, new_conversation)
+        ai_response_content = await persona_service.get_initial_response(user=current_user, first_message_content=user_message.content)
+    except HTTPException: raise
     except Exception as e:
-        print(f"Error saving conversation to DB: {e}")
-        raise HTTPException(status_code=500, detail="Could not save the new conversation.")
+        logger.error(f"API: Unhandled error getting initial AI response: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate initial AI response.")
+    ai_message = Message(role="future_self", content=ai_response_content)
+    new_conv_data.messages.append(ai_message)
+    new_conv_data.updated_at = ai_message.timestamp
+    created_conversation_in_db = await db_create_conversation(db, new_conv_data)
+    return ConversationResponse(id=created_conversation_in_db.id, **created_conversation_in_db.model_dump(exclude={"id"}))
 
-    return created_conversation
-
-
-@router.post(
-    "/{conversation_id}/messages",
-    response_model=Conversation,
-    status_code=status.HTTP_200_OK,
-    summary="Send a message to an existing conversation",
-    description="Adds a user message and gets the next Groq-powered future self response.",
-)
-async def send_message(
-    conversation_id: str,
-    request: SendMessageRequest = Body(...),
-    db = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+@router.post("/conversations/{conversation_id}/messages", response_model=ConversationResponse, summary="Send a message")
+async def send_message_to_conversation(
+    conversation_id: str, request_body: SendMessageRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db), current_user: User = Depends(get_current_active_user),
 ):
-    """
-    Sends a subsequent message in an existing conversation using Groq LLM.
-
-    - Retrieves conversation history.
-    - **WARNING:** Handles user input (potential PHI) and conversation history.
-      Ensure ongoing user consent and compliance.
-    - Appends the new user message.
-    - Calls PersonaService/Groq with updated history.
-    - Appends the 'future self' response.
-    - Updates and returns the conversation.
-    """
-    # --- !! PHI Consent Check (if applicable) !! ---
-    # if current_user.might_input_phi and not current_user.has_consented_to_phi_processing:
-    #     raise HTTPException(status_code=403, detail="User consent required.")
-
-    persona_service = PersonaService(db)
-    conversation = await db_get_conversation(db, conversation_id, current_user.id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found or access denied.")
-
-    user_message = Message(role="user", content=request.content)
-    conversation.messages.append(user_message)
-    conversation.updated_at = user_message.timestamp # Update timestamp before AI call
-
+    logger.info(f"API: User '{current_user.id}' sending message to conversation '{conversation_id}'.")
+    existing_conversation_in_db = await db_get_conversation(db, conversation_id, current_user.id)
+    if not existing_conversation_in_db:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found or access denied.")
+    try: persona_service = PersonaService(db)
+    except ValueError as e: raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except RuntimeError as e: raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    user_message = Message(role="user", content=request_body.content)
+    existing_conversation_in_db.messages.append(user_message)
     try:
-        future_self_content = await persona_service.get_next_response(
-            user=current_user, conversation_history=conversation.messages
-        )
-    except HTTPException as http_exc: # Catch specific HTTP exceptions from service
-         # Consider saving the user message even if AI fails?
-         # await db_update_conversation(db, conversation) # Save up to user message
-         raise http_exc
+        ai_response_content = await persona_service.get_next_response(user=current_user, conversation_history=existing_conversation_in_db.messages)
+    except HTTPException: raise
     except Exception as e:
-        print(f"Unhandled error getting next AI response: {e}")
-        # await db_update_conversation(db, conversation) # Save up to user message?
-        raise HTTPException(status_code=500, detail="Internal server error generating response.")
+        logger.error(f"API: Unhandled error getting next AI response for conv '{conversation_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate AI response.")
+    ai_message = Message(role="future_self", content=ai_response_content)
+    existing_conversation_in_db.messages.append(ai_message)
+    updated_conversation_in_db = await db_update_conversation(db, existing_conversation_in_db)
+    return ConversationResponse(id=updated_conversation_in_db.id, **updated_conversation_in_db.model_dump(exclude={"id"}))
 
-
-    future_self_message = Message(role="future_self", content=future_self_content) # Or "assistant"
-    conversation.messages.append(future_self_message)
-    conversation.updated_at = future_self_message.timestamp # Final update
-
-    try:
-        updated_conversation = await db_update_conversation(db, conversation)
-    except Exception as e:
-        print(f"Error updating conversation in DB: {e}")
-        raise HTTPException(status_code=500, detail="Could not save the updated conversation.")
-
-    return updated_conversation
-
-
-@router.get(
-    "/{conversation_id}",
-    response_model=Conversation,
-    summary="Get a specific conversation",
-    description="Retrieves the full history of a specific conversation.",
-)
-async def get_conversation(
-    conversation_id: str,
-    db = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+@router.get("/conversations/{conversation_id}", response_model=ConversationResponse, summary="Get a specific conversation")
+async def get_conversation_details(
+    conversation_id: str, db: AsyncIOMotorDatabase = Depends(get_db), current_user: User = Depends(get_current_active_user)
 ):
-    conversation = await db_get_conversation(db, conversation_id, current_user.id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found or access denied.")
-    return conversation
+    conv_in_db = await db_get_conversation(db, conversation_id, current_user.id)
+    if not conv_in_db: raise HTTPException(status_code=404, detail="Conversation not found or access denied.")
+    return ConversationResponse(id=conv_in_db.id, **conv_in_db.model_dump(exclude={"id"}))
 
-
-@router.get(
-    "/",
-    response_model=List[Conversation],
-    summary="List user's conversations",
-    description="Retrieves a list of conversations for the current user.",
-)
+@router.get("/conversations", response_model=List[ConversationResponse], summary="List user's conversations")
 async def list_conversations(
-    skip: int = 0,
-    limit: int = 20,
-    db = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    skip: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100), # Query was missing import
+    db: AsyncIOMotorDatabase = Depends(get_db), current_user: User = Depends(get_current_active_user)
 ):
-    if limit > 100: limit = 100
-    conversations = await db_get_user_conversations(db, current_user.id, skip=skip, limit=limit)
-    return conversations
-
-# --- Include in main.py ---
-# import conversations
-# app.include_router(conversations.router)
+    logger.debug(f"Listing conversations for user '{current_user.id}', skip={skip}, limit={limit}")
+    if not isinstance(db, AsyncIOMotorDatabase):
+        logger.error("list_conversations: `db` is not AsyncIOMotorDatabase. Placeholder active.")
+        return []
+    try:
+        conversations_collection: AsyncIOMotorCollection = db[CONVERSATIONS_COLLECTION_NAME]
+        cursor = conversations_collection.find({"user_id": current_user.id}).sort("updated_at", -1).skip(skip).limit(limit)
+        db_convs = await cursor.to_list(length=limit)
+        response_list = [
+            ConversationResponse(id=conv_doc["_id"], **{k:v for k,v in conv_doc.items() if k != "_id"}) 
+            for conv_doc in db_convs
+        ]
+        return response_list
+    except Exception as e:
+        logger.error(f"DB error listing conversations for user '{current_user.id}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving conversations.")
